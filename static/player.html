@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>播放影片中...</title>
+    <script charset="utf-8" src="https://static.line-scdn.net/liff/edge/2/sdk.js"></script>
+    <style>
+        body { margin: 0; background-color: #8eb8dc; display: flex; justify-content: center; align-items: center; height: 100vh; overflow: hidden; transition: opacity 1s ease; }
+        video { max-width: 90%; max-height: 90%; border-radius: 15px; box-shadow: 0 10px 30px rgba(0,0,0,0.3); pointer-events: none; }
+        .fade-out { opacity: 0; }
+    </style>
+</head>
+<body>
+    <video id="myVideo" playsinline autoplay></video>
+
+    <script>
+        // 記得替換成你的播放器 LIFF ID
+        const LIFF_ID = "2009716676-IRSKacfn"; 
+
+        async function main() {
+            await liff.init({ liffId: LIFF_ID });
+
+            const urlParams = new URLSearchParams(window.location.search);
+            const videoName = urlParams.get('video');
+
+            if (videoName) {
+                const video = document.getElementById('myVideo');
+                video.src = "/results/" + videoName;
+                
+                video.onended = () => {
+                    document.body.classList.add('fade-out');
+                    setTimeout(() => {
+                        liff.closeWindow();
+                    }, 1000);
+                };
+            } else {
+                alert("找不到影片檔案！");
+            }
+        }
+        main();
+    </script>
+</body>
+</html>

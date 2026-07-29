@@ -14,3 +14,40 @@ evaluation/test_filelists/lr*.txt
 *.gif
 *.webm
 *.mp3
+# 原始 Wav2Lip 忽略設定
+
+# 1. 虛擬環境
+.venv/
+venv/
+ENV/
+
+# 2. 模型權重與超大檔案
+checkpoints/
+*.pth
+*.pt
+
+# 3. 執行檔
+*.exe
+*.exe.old
+
+# 4. 系統與 IDE 快取檔
+__pycache__/
+.vscode/
+.idea/
+
+# 5. 生成結果與隱私資料夾
+inputs/*
+results/*
+temp/*
+!inputs/.gitkeep
+!results/.gitkeep
+!temp/.gitkeep
+
+# 6. 敏感金鑰檔
+.env
+
+# 7. 專案中用不到的原始程式碼 (不推送到 GitHub)
+test.py
+inference.py
+preprocess.py
+*train.py

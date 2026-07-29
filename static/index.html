@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>播放影片中...</title>
+    <script charset="utf-8" src="https://static.line-scdn.net/liff/edge/2/sdk.js"></script>
+    <style>
+        /* 這裡把背景色設定成跟 LINE 聊天室很像的灰藍色 */
+        body { margin: 0; background-color: #8eb8dc; display: flex; justify-content: center; align-items: center; height: 100vh; overflow: hidden; transition: opacity 1s ease; }
+        /* 影片樣式：不顯示控制列，稍微加點圓角和陰影讓它有浮出感 */
+        video { max-width: 90%; max-height: 90%; border-radius: 15px; box-shadow: 0 10px 30px rgba(0,0,0,0.3); pointer-events: none; }
+        .fade-out { opacity: 0; }
+    </style>
+</head>
+<body>
+    <!-- playsinline 是為了防止 iPhone 強制全螢幕播放 -->
+    <video id="myVideo" playsinline autoplay></video>
+
+    <script>
+        // ⚠️ 記得替換成你剛剛拿到的播放器 LIFF ID
+        const LIFF_ID = "你的_LIFF_ID"; 
+
+        async function main() {
+            await liff.init({ liffId: LIFF_ID });
+
+            // 從網址列抓取我們要播放的影片檔名 (例如 ?video=result_123.mp4)
+            const urlParams = new URLSearchParams(window.location.search);
+            const videoName = urlParams.get('video');
+
+            if (videoName) {
+                const video = document.getElementById('myVideo');
+                // 設定影片來源
+                video.src = "/results/" + videoName;
+                
+                // 魔法核心：監聽影片是否「播放結束」
+                video.onended = () => {
+                    // 1. 幫整個網頁加上透明度歸零的特效 (淡出)
+                    document.body.classList.add('fade-out');
+                    
+                    // 2. 等待 1 秒鐘淡出動畫跑完後，呼叫 LINE 關閉視窗的指令
+                    setTimeout(() => {
+                        liff.closeWindow();
+                    }, 1000);
+                };
+            } else {
+                alert("找不到影片檔案！");
+            }
+        }
+        main();
+    </script>
+</body>
+</html>
