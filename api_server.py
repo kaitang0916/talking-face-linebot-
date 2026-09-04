@@ -26,7 +26,7 @@ from linebot.v3.webhooks import MessageEvent, ImageMessageContent, AudioMessageC
 
 import math
 import random
-from warper import FaceWarper  # 匯入我們剛寫好的變形模組
+from warper import FaceWarper  # 匯入變形模組(表情)
 
 # ==========================================
 # 1. 全域變數與模型預載 (Lifespan 模式)
@@ -74,6 +74,50 @@ app.mount("/results", StaticFiles(directory="results"), name="results")
 # ==========================================
 # 3. 核心對嘴運算邏輯 (整合動態縮放與去模糊)
 # ==========================================
+def plan_expressions(total_frames, brow_dur=15, blink_dur=6, gap=4):
+    """
+    在整支影片的時間軸上排定「挑眉」與「眨眼」。
+
+    保證：
+      1. 兩種表情的區間彼此不重疊 (中間至少隔 gap 幀)，不會同時出現。
+      2. 挑眉與眨眼在整段影片中各至少出現一次。
+
+    回傳 [(kind, start_frame, duration), ...]；影片短到連一次都塞不下時回傳 []。
+    """
+    # 影片越長眨眼次數越多 (約每 3 秒眨一次)，但至少要有一次
+    blink_count = max(1, total_frames // 75)
+
+    # 需要的總長度 = 挑眉 + 所有眨眼 + 事件之間的間隔
+    def span():
+        return brow_dur + blink_dur * blink_count + gap * blink_count
+
+    # 排不下時：先減少眨眼次數，還是不夠就縮短間隔並按比例壓縮動畫長度
+    while blink_count > 1 and span() > total_frames:
+        blink_count -= 1
+    if span() > total_frames:
+        gap = 1
+        shrink = (total_frames - gap) / (brow_dur + blink_dur)
+        brow_dur = max(2, int(brow_dur * shrink))
+        blink_dur = max(2, int(blink_dur * shrink))
+    if span() > total_frames:
+        return []  # 音檔太短 (不到約 0.2 秒)，放棄表情
+
+    events = [('brow', brow_dur)] + [('blink', blink_dur)] * blink_count
+    random.shuffle(events)  # 隨機決定誰先誰後
+
+    # 為每個事件抽一個「累進」的偏移量，讓表情隨機散布在整支影片上，
+    # 偏移量排序後保證後面的事件不會往前壓到前一個事件。
+    slack = total_frames - span()
+    offsets = sorted(random.randint(0, slack) for _ in events)
+
+    schedule = []
+    cursor = 0
+    for (kind, dur), off in zip(events, offsets):
+        schedule.append((kind, cursor + off, dur))
+        cursor += dur + gap
+    return schedule
+
+
 def process_wav2lip(face_path: str, audio_path: str, final_out_path: str):
     out_temp = final_out_path.replace('.mp4', '_temp.avi')
     
@@ -146,16 +190,23 @@ def process_wav2lip(face_path: str, audio_path: str, final_out_path: str):
     # 新增：初始化表情產生器與時間軸
     # --------------------------------------------------
     total_frames = len(mel_chunks)
-    expression_duration = 15 # 挑眉動畫持續 15 幀
-    
-    # 隨機決定挑眉發生的起始時間
-    if total_frames > expression_duration:
-        start_expr_frame = random.randint(0, total_frames - expression_duration)
-    else:
-        start_expr_frame = -1
 
     warper = FaceWarper()
     landmarks_data = warper.get_landmarks(frame_small)
+
+    # 把排程攤平成「幀 -> (表情種類, 進度)」對照表。
+    # 一幀只會對應到一種表情，所以挑眉與眨眼不可能同時發生。
+    expression_timeline = {}
+    schedule = plan_expressions(total_frames) if landmarks_data else []
+    for kind, start, dur in schedule:
+        for f in range(start, start + dur):
+            expression_timeline[f] = (kind, (f - start) / dur)
+
+    if landmarks_data:
+        print(f"[表情排程] 共 {total_frames} 幀 -> " +
+              ", ".join(f"{k}@{s}~{s + d - 1}" for k, s, d in sorted(schedule, key=lambda e: e[1])))
+    else:
+        print("[表情排程] 偵測不到 FaceMesh 特徵點，本次不加入表情")
 
     # --------------------------------------------------
     # E. 開始批次生成與後處理 (Wav2Lip 推論 -> 放大 -> 去模糊)
@@ -167,12 +218,17 @@ def process_wav2lip(face_path: str, audio_path: str, final_out_path: str):
     for i, m in enumerate(mel_chunks):
         current_frame_img = frame_small.copy()
         
-        # 如果這一幀剛好落在要挑眉的區間內，就執行變形
-        if landmarks_data and (start_expr_frame <= i < start_expr_frame + expression_duration):
+        # 如果這一幀剛好落在某個表情的區間內，就執行變形
+        # progress 0->1 搭配 sin 曲線，做出「動作到頂再回復」的完整循環
+        if i in expression_timeline:
+            kind, progress = expression_timeline[i]
             landmarks, h, w = landmarks_data
-            progress = (i - start_expr_frame) / expression_duration
-            lift_ratio = math.sin(progress * math.pi) * 0.02
-            current_frame_img = warper.create_expression(current_frame_img, landmarks, h, w, lift_ratio)
+            if kind == 'brow':
+                lift_ratio = math.sin(progress * math.pi) * 0.02
+                current_frame_img = warper.create_expression(current_frame_img, landmarks, h, w, lift_ratio)
+            else:
+                blink_ratio = math.sin(progress * math.pi)
+                current_frame_img = warper.create_blink(current_frame_img, landmarks, h, w, blink_ratio)
         
         current_face_crop = cv2.resize(current_frame_img[y1:y2, x1:x2], (96, 96))
         
