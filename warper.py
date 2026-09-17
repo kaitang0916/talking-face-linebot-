@@ -1,4 +1,5 @@
 import cv2
+import math
 import numpy as np
 import mediapipe as mp
 
@@ -66,6 +67,43 @@ class FaceWarper:
         self.BLINK_MIN_GAP_PX = 2.5
         self.BLINK_BROW_FOLLOW = 0.4
 
+        # --- 背景錨點 (防止表情變形蔓延到背景造成跳動) ---
+        # TPS 是全域平滑曲面：只釘住臉部輪廓和圖片四角，中間那片沒有控制點的背景
+        # 仍然會跟著眉毛/眼皮的位移微微鼓動，影片裡看起來就是背景在跳。
+        # 解法是在「圖片四邊」和「臉部外圍」補一圈固定錨點，把變形關在臉裡面。
+        # BG_BORDER_PTS: 圖片每一邊補幾個錨點 (不含四角)
+        # BG_HALO_RINGS: 臉部外圍光環的半徑倍率 (0.3 = 比臉的外接橢圓大 30%)，可以多圈
+        # BG_HALO_PTS:   每圈光環的錨點數
+        self.BG_BORDER_PTS = 8
+        self.BG_HALO_RINGS = [0.30]
+        self.BG_HALO_PTS = 20
+
+    def _background_anchors(self, landmarks, h, w):
+        """回傳一組要完全固定的背景座標：圖片四邊 + 臉部外圍的橢圓光環。"""
+        pts = []
+        # 1. 圖片四邊 (四角由呼叫端另外加)
+        n = self.BG_BORDER_PTS
+        for k in range(1, n + 1):
+            t = k / (n + 1)
+            pts.append([t * (w - 1), 0.0])
+            pts.append([t * (w - 1), h - 1.0])
+            pts.append([0.0, t * (h - 1)])
+            pts.append([w - 1.0, t * (h - 1)])
+        # 2. 臉部外圍光環：以臉部輪廓的外接框為基準畫橢圓，往外放大
+        xs = [landmarks[i].x * w for i in self.jaw_idx]
+        ys = [landmarks[i].y * h for i in self.jaw_idx]
+        cx, cy = (min(xs) + max(xs)) / 2.0, (min(ys) + max(ys)) / 2.0
+        rx, ry = (max(xs) - min(xs)) / 2.0, (max(ys) - min(ys)) / 2.0
+        for m in self.BG_HALO_RINGS:
+            for k in range(self.BG_HALO_PTS):
+                a = 2.0 * math.pi * k / self.BG_HALO_PTS
+                x = cx + rx * (1.0 + m) * math.cos(a)
+                y = cy + ry * (1.0 + m) * math.sin(a)
+                # 落在圖片外的點直接捨棄，那個方向已經有邊界錨點
+                if 0.0 <= x <= w - 1.0 and 0.0 <= y <= h - 1.0:
+                    pts.append([x, y])
+        return pts
+
     def get_landmarks(self, image):
         h, w = image.shape[:2]
         results = self.face_mesh.process(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
@@ -77,6 +115,16 @@ class FaceWarper:
     def create_expression(self, image, landmarks, h, w, lift_ratio):
         source_pts = []
         target_pts = []
+        seen = set()
+
+        def add(pt, target):
+            # 座標重複的控制點會讓 TPS 的核矩陣出現重複列而變得奇異，一律去重
+            key = (round(pt[0], 1), round(pt[1], 1))
+            if key in seen:
+                return
+            seen.add(key)
+            source_pts.append(pt)
+            target_pts.append(target)
         
         # --- 新增：動態測量臉部高度 ---
         # landmarks[152] 是下巴最底端，landmarks[10] 是額頭最頂端
@@ -86,42 +134,37 @@ class FaceWarper:
         # 將臉部高度乘上比例，得出這張照片真正該移動的像素量
         actual_lift_pixels = face_pixel_height * lift_ratio
         
-        # 1. 圖片四個角落作為絕對錨點
-        corners = [[0, 0], [w-1, 0], [0, h-1], [w-1, h-1]]
-        for c in corners:
-            source_pts.append(c)
-            target_pts.append(c)
+        # 1. 圖片四個角落 + 四邊 + 臉部外圍光環，作為絕對錨點 (把變形關在臉裡面)
+        for c in ([0, 0], [w-1, 0], [0, h-1], [w-1, h-1]):
+            add(c, list(c))
+        for pt in self._background_anchors(landmarks, h, w):
+            add(pt, list(pt))
             
         # 2. 加入臉部輪廓作為固定錨點
         for idx in self.jaw_idx:
             pt = [int(landmarks[idx].x * w), int(landmarks[idx].y * h)]
-            source_pts.append(pt)
-            target_pts.append(pt)
+            add(pt, list(pt))
             
         # 2.5 加入眼睛輪廓作為固定錨點 (你剛剛加上的)
         for idx in self.left_eye_idx + self.right_eye_idx:
             pt = [int(landmarks[idx].x * w), int(landmarks[idx].y * h)]
-            source_pts.append(pt)
-            target_pts.append(pt) 
+            add(pt, list(pt))
 
         # 2.6 加入額頭與鼻樑作為「完全固定」的錨點
         for idx in self.forehead_fixed_idx + self.nose_bridge_idx:
             pt = [int(landmarks[idx].x * w), int(landmarks[idx].y * h)]
-            source_pts.append(pt)
-            target_pts.append(pt)  # 座標不變，完全鎖死
+            add(pt, list(pt))  # 座標不變，完全鎖死
          
         # 3. 加入眉毛作為移動點
         for idx in self.eyebrow_idx:
             pt = [int(landmarks[idx].x * w), int(landmarks[idx].y * h)]
-            source_pts.append(pt)
             # 這裡改用動態計算出來的 actual_lift_pixels
-            target_pts.append([pt[0], pt[1] - actual_lift_pixels])
+            add(pt, [pt[0], pt[1] - actual_lift_pixels])
         # 4. 新增：加入眉毛上方的過渡區 (只移動 50% 距離)
         for idx in self.eyebrow_transition_idx:
             pt = [int(landmarks[idx].x * w), int(landmarks[idx].y * h)]
-            source_pts.append(pt)
             # 乘以 0.5 讓這區的皮膚產生被擠壓的感覺，而不會像塑膠一樣被死板地拉長
-            target_pts.append([pt[0], pt[1] - (actual_lift_pixels * 0.5)])
+            add(pt, [pt[0], pt[1] - (actual_lift_pixels * 0.5)])
             
         # (後面轉換 Numpy Array 與執行 TPS 的程式碼維持不變)
         src_arr = np.array(source_pts, dtype=np.float32).reshape(1, -1, 2)
@@ -164,9 +207,11 @@ class FaceWarper:
             source_pts.append(pt)
             target_pts.append(target)
 
-        # 1. 圖片四個角落作為絕對錨點
+        # 1. 圖片四個角落 + 四邊 + 臉部外圍光環，作為絕對錨點 (把變形關在臉裡面)
         for c in ([0.0, 0.0], [w - 1.0, 0.0], [0.0, h - 1.0], [w - 1.0, h - 1.0]):
             add(c, list(c))
+        for pt in self._background_anchors(landmarks, h, w):
+            add(pt, list(pt))
 
         # 2. 先算好每個上眼皮點要往下移多少 (只動 y；x 不動，避免眼角被往內擠)
         lid_moves = []
