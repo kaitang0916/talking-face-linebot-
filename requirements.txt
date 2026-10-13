@@ -9,3 +9,4 @@ torchvision
 librosa==0.9.2
 scipy
 tqdm==4.67.3
+funasr==1.4.16

@@ -29,6 +29,8 @@ import random
 import time
 from concurrent.futures import ThreadPoolExecutor
 from warper import FaceWarper  # 匯入變形模組(表情)
+from emotion import load_emotion_model, detect_emotion  # 匯入語音情緒偵測
+from bgm import pick_bgm, build_mix_filter  # 匯入背景音樂 (依情緒挑歌與混音)
 
 # ==========================================
 # 1. 全域變數與模型預載 (Lifespan 模式)
@@ -36,12 +38,13 @@ from warper import FaceWarper  # 匯入變形模組(表情)
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 wav2lip_model = None
 face_detector = None
-user_states = {} 
+emotion_model = None
+user_states = {}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # --- 啟動時執行 ---
-    global wav2lip_model, face_detector
+    global wav2lip_model, face_detector, emotion_model
     print("\n[系統啟動] 正在載入 AI 模型")
     
     checkpoint_path = "checkpoints/wav2lip_gan.pth" 
@@ -53,6 +56,9 @@ async def lifespan(app: FastAPI):
 
     face_detector = face_detection.FaceAlignment(
         face_detection.LandmarksType._2D, flip_input=False, device=device)
+
+    # 情緒偵測模型常駐記憶體，每個請求只需推論
+    emotion_model = load_emotion_model(device)
     print("模型載入完畢，伺服器已就緒！\n")
     yield
     # --- 關閉時執行 ---
@@ -63,9 +69,24 @@ app = FastAPI(lifespan=lifespan)
 # ==========================================
 # 2. LINE Bot 憑證與設定 (請確保與後台一致)
 # ==========================================
-NGROK_URL = "你的 Ngrok 網址" # 你的 Ngrok 網址
-CHANNEL_ACCESS_TOKEN = 'YOUR_CHANNEL_ACCESS_TOKEN'
-CHANNEL_SECRET = 'YOUR_CHANNEL_SECRET'
+# 金鑰放在專案根目錄的 .env (已被 .gitignore 忽略，不會推上 GitHub)，格式見 .env.example
+def load_env_file(filename=".env"):
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
+    if not os.path.isfile(path):
+        print(f"⚠️ 找不到 {filename}，請複製 .env.example 為 .env 並填入 LINE 金鑰")
+        return
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            os.environ.setdefault(key.strip(), value.strip())
+
+load_env_file()
+NGROK_URL = os.environ.get("NGROK_URL", "")                            # 你的 Ngrok 網址
+CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")  # YOUR_CHANNEL_ACCESS_TOKEN
+CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")              # YOUR_CHANNEL_SECRET
 
 configuration = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(CHANNEL_SECRET)
@@ -127,7 +148,9 @@ def plan_expressions(total_frames, brow_dur=15, blink_dur=6, gap=4):
     return schedule
 
 
-def process_wav2lip(face_path: str, audio_path: str, final_out_path: str):
+def process_wav2lip(face_path: str, audio_path: str, final_out_path: str, bgm: dict = None):
+    # bgm: pick_bgm() 的結果；None = 不加背景音樂
+    # 注意：Wav2Lip 的嘴型永遠只用 audio_path 的乾淨人聲計算，背景音樂只在最後編碼時混進音軌
     if not os.path.isfile(face_path) or not os.path.isfile(audio_path):
         return False, "找不到原始檔案"
 
@@ -202,9 +225,20 @@ def process_wav2lip(face_path: str, audio_path: str, final_out_path: str):
     ffmpeg_cmd = [
         'ffmpeg', '-y', '-loglevel', 'error',
         '-f', 'rawvideo', '-pix_fmt', 'bgr24',
-        '-s', f'{original_width}x{original_height}', '-r', str(fps), '-i', '-',
-        '-i', audio_path,
-        '-vf', 'crop=trunc(iw/2)*2:trunc(ih/2)*2',
+        '-s', f'{original_width}x{original_height}', '-r', str(fps), '-i', '-',   # 0: 畫面 (pipe)
+        '-i', audio_path,                                                         # 1: 人聲
+    ]
+    if bgm is None:
+        ffmpeg_cmd += ['-vf', 'crop=trunc(iw/2)*2:trunc(ih/2)*2']
+    else:
+        # 2: 背景音樂，-stream_loop -1 讓它無限循環，長度由 amix 以人聲為準截斷
+        ffmpeg_cmd += [
+            '-stream_loop', '-1', '-i', bgm["path"],
+            '-filter_complex',
+            '[0:v]crop=trunc(iw/2)*2:trunc(ih/2)*2[vout];' + build_mix_filter(bgm["gain_db"], len(wav) / 16000),
+            '-map', '[vout]', '-map', '[aout]',
+        ]
+    ffmpeg_cmd += [
         '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '18', '-pix_fmt', 'yuv420p',
         '-c:a', 'aac',
         final_out_path,
@@ -436,10 +470,27 @@ def handle_audio(event):
         with open(m4a_path, "wb") as f: f.write(audio_content)
         subprocess.call(f'ffmpeg -y -i {m4a_path} -ar 16000 {wav_path} -loglevel error', shell=True)
 
-        # 2. 生成影片 
+        # 1.5 語音情緒偵測 + 挑背景音樂 (失敗就不加配樂，不影響影片生成)
+        bgm = None
+        try:
+            t0 = time.time()
+            wav = audio.load_wav(wav_path, 16000)
+            emotion = detect_emotion(emotion_model, wav)
+            scores = ", ".join(f"{k}={v:.2f}" for k, v in sorted(emotion["scores"].items(), key=lambda kv: -kv[1])[:3])
+            print(f"[情緒] {emotion['top']} | 分組={emotion['group']} | {scores} | {time.time() - t0:.2f}s")
+
+            bgm = pick_bgm(emotion, wav)
+            if bgm:
+                print(f"[配樂] {os.path.basename(bgm['path'])} | 增益 {bgm['gain_db']:+.1f}dB")
+            else:
+                print("[配樂] 不加背景音樂")
+        except Exception as e:
+            print(f"[情緒/配樂] 失敗，這次不加背景音樂: {e}")
+
+        # 2. 生成影片
         final_name = f"result_{user_id}.mp4"
         final_path = f"results/{final_name}"
-        success, msg = process_wav2lip(face_path, wav_path, final_path)
+        success, msg = process_wav2lip(face_path, wav_path, final_path, bgm=bgm)
 
         # 3. 推送結果
         if success:

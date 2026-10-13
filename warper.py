@@ -9,7 +9,9 @@ class FaceWarper:
         self.face_mesh = self.mp_face_mesh.FaceMesh(
             static_image_mode=True, 
             max_num_faces=1, 
-            refine_landmarks=False
+            # 開啟眼睛/嘴唇的精細模型。沒開的話上眼皮點常落在眼眶內側 1~5px，
+            # 眨眼時會把虹膜頂端一起往上拉，在眼皮上留下一團深色的影子
+            refine_landmarks=True
         )
         
         # 目標移動點：眉毛
@@ -62,10 +64,19 @@ class FaceWarper:
         #   兩者一旦重合，TPS 會出現「同一座標要對應到兩個不同目標」的矛盾約束
         #   而解出奇異解，整張臉會融成一團。
         # BLINK_BROW_FOLLOW: 眉毛跟著眼皮下沉的比例。
-        #   眉毛完全釘死的話，眼皮下移會把眉眼之間的皮膚擠壓到極限而破圖。
+        #   以前設 0.4 是為了避免眉眼之間的皮膚被擠壓到破圖，但會讓眉毛和瀏海被拉下來；
+        #   現在改由下面的護欄錨點分擔拉伸，眉毛可以完全釘死。
+        # BLINK_GUARD_GAP: 在上眼皮點正上方 (該眼最大開口高度 x 這個倍率) 處放一個「護欄」錨點。
+        #   TPS 是全域平滑內插，眼皮往下拉時位移會一路擴散到眉毛和瀏海，
+        #   看起來就是頭髮被拉下來。護欄把位移擋在眼皮附近。
+        #   太小 → 護欄和眼皮擠在一起，眼皮皮膚被拉長到破圖；太大 → 擋不住。
+        # BLINK_GUARD_FOLLOW: 護欄跟著眼皮下沉的比例 (0 = 完全釘死)。
+        #   留一點點跟隨可以讓眼皮皮膚的拉伸分散開，不會全部擠在護欄下方。
         self.BLINK_MAX_CLOSE = 0.75
         self.BLINK_MIN_GAP_PX = 2.5
-        self.BLINK_BROW_FOLLOW = 0.4
+        self.BLINK_BROW_FOLLOW = 0.0
+        self.BLINK_GUARD_GAP = 0.6
+        self.BLINK_GUARD_FOLLOW = 0.15
 
         # --- 背景錨點 (防止表情變形蔓延到背景造成跳動) ---
         # TPS 是全域平滑曲面：只釘住臉部輪廓和圖片四角，中間那片沒有控制點的背景
@@ -215,6 +226,7 @@ class FaceWarper:
 
         # 2. 先算好每個上眼皮點要往下移多少 (只動 y；x 不動，避免眼角被往內擠)
         lid_moves = []
+        lid_travel = {}  # 上眼皮點 index -> 往下移的距離 (給護欄錨點用)
         for upper_idx, lower_idx in self.blink_pairs:
             up_x, up_y = landmarks[upper_idx].x * w, landmarks[upper_idx].y * h
             low_y = landmarks[lower_idx].y * h
@@ -225,6 +237,7 @@ class FaceWarper:
             travel = min(eye_gap * self.BLINK_MAX_CLOSE * blink_ratio,
                          eye_gap - self.BLINK_MIN_GAP_PX)
             lid_moves.append((up_x, up_y, travel))
+            lid_travel[upper_idx] = travel
 
         # 3. 臉部輪廓、額頭、鼻樑、中臉、眼角全部鎖死，把變形侷限在眼睛附近
         for idx in (self.jaw_idx + self.forehead_fixed_idx + self.nose_bridge_idx +
@@ -250,6 +263,25 @@ class FaceWarper:
         # 6. 上眼皮往下移
         for up_x, up_y, travel in lid_moves:
             add([up_x, up_y], [up_x, up_y + travel])
+
+        # 7. 上眼皮上方的護欄錨點：把位移擋在眼皮附近，不讓眉毛和瀏海被拉下來
+        #    護欄高度用「同一隻眼睛的最大開口」統一計算，連成一條平滑的弧線。
+        #    若用各點自己的開口，眼角附近開口很小，護欄會貼在眼皮上，
+        #    TPS 在那裡會把睫毛線扭成往上勾的形狀。
+        half = len(self.blink_pairs) // 2  # 前半是左眼、後半是右眼
+        eye_max_gap = {}
+        for k, (upper_idx, lower_idx) in enumerate(self.blink_pairs):
+            gap = (landmarks[lower_idx].y - landmarks[upper_idx].y) * h
+            eye_max_gap[k // half] = max(eye_max_gap.get(k // half, 0.0), gap)
+        for k, (upper_idx, _) in enumerate(self.blink_pairs):
+            # 最靠近眼角的兩個點不放護欄：那裡開口小、離固定的眼角很近，
+            # 再加護欄的話三種位移擠在一起，TPS 會把睫毛線扭成往上勾
+            if k % half in (0, half - 1):
+                continue
+            up_x, up_y = landmarks[upper_idx].x * w, landmarks[upper_idx].y * h
+            travel = lid_travel.get(upper_idx, 0.0)
+            guard = [up_x, up_y - eye_max_gap[k // half] * self.BLINK_GUARD_GAP]
+            add(guard, [guard[0], guard[1] + travel * self.BLINK_GUARD_FOLLOW])
 
         src_arr = np.array(source_pts, dtype=np.float32).reshape(1, -1, 2)
         dst_arr = np.array(target_pts, dtype=np.float32).reshape(1, -1, 2)
